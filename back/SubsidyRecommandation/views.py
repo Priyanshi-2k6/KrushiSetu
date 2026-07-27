@@ -10,6 +10,27 @@ import os
 import hashlib
 import json
 
+
+def _derive_category(title: str, description: str) -> str:
+    """Derive a category label from title/description since the model has no category field."""
+    text = f"{title} {description}".lower()
+    if any(w in text for w in ['drip', 'irrigation', 'water', 'pump', 'sprinkler']):
+        return 'Irrigation'
+    if any(w in text for w in ['seed', 'crop', 'fertilizer', 'pesticide', 'organic', 'soil']):
+        return 'Crop Input'
+    if any(w in text for w in ['equipment', 'tractor', 'machine', 'tool', 'implement']):
+        return 'Equipment'
+    if any(w in text for w in ['insurance', 'fasal bima', 'loss', 'disaster', 'flood', 'drought']):
+        return 'Insurance'
+    if any(w in text for w in ['loan', 'credit', 'kisan', 'finance', 'bank']):
+        return 'Credit'
+    if any(w in text for w in ['solar', 'energy', 'power', 'electricity']):
+        return 'Energy'
+    if any(w in text for w in ['storage', 'warehouse', 'cold chain', 'market']):
+        return 'Post-Harvest'
+    return 'General'
+
+
 @csrf_exempt
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -17,7 +38,7 @@ def recommend_subsidies(request):
     try:
         # Extract farmer_profile from request
         request_data = request.data.get('farmer_profile', request.data)
-        
+
         farmer_profile = {
             "income": request_data.get("income", ""),
             "farmer_type": request_data.get("farmer_type", ""),
@@ -32,89 +53,92 @@ def recommend_subsidies(request):
             "temperature_zone": request_data.get("temperature_zone", ""),
             "past_subsidies": request_data.get("past_subsidies", []),
         }
-        
+
         required_field = ["income", "farmer_type", "land_size", "crop_type", "state"]
         missing_fields = [field for field in required_field if not farmer_profile.get(field)]
-        
+
         if missing_fields:
             return Response({
                 "success": False,
                 "error": f"Missing required fields: {', '.join(missing_fields)}"
             }, status=status.HTTP_400_BAD_REQUEST)
-            
-        # ------------------------ Load Subsidy From Backend (with caching) ---------------------
-        # Try to get subsidies from cache first
-        subsidies_cache_key = "all_subsidies_data"
+
+        # ------------------------ Load Subsidies From DB (with caching) ---------------------
+        subsidies_cache_key = "all_subsidies_data_v2"
         subsidies = cache.get(subsidies_cache_key)
-        
+
         if subsidies is None:
-            subsidies = Subsidy.objects.all().values(
-                'id', 'title', 'description', 'amount', 'eligibility', 'documents_required', 
-                'application_start_date', 'application_end_date'
+            raw_subsidies = Subsidy.objects.all().values(
+                'id', 'title', 'description', 'amount', 'eligibility',
+                'documents_required', 'application_start_date', 'application_end_date', 'rating'
             )
-            # Cache subsidies for 30 minutes (they don't change frequently)
-            cache.set(subsidies_cache_key, list(subsidies), 1800)
+            subsidies = []
+            for s in raw_subsidies:
+                subsidies.append({
+                    'id': s['id'],
+                    'title': s['title'],
+                    'description': s['description'],
+                    'amount': float(s['amount']),
+                    'category': _derive_category(s['title'], s['description']),
+                    'rating': float(s.get('rating') or 0),
+                    'eligibility_criteria': s['eligibility'] if s['eligibility'] else [],
+                    'documents_required': s['documents_required'] if s['documents_required'] else [],
+                    'application_start_date': s['application_start_date'].isoformat() if s['application_start_date'] else None,
+                    'application_end_date': s['application_end_date'].isoformat() if s['application_end_date'] else None,
+                })
+            # Cache formatted list for 30 minutes (subsidies change infrequently)
+            cache.set(subsidies_cache_key, subsidies, 1800)
             print("Loaded subsidies from database")
         else:
             print("Loaded subsidies from cache")
-        
+
         if not subsidies:
             return Response({
                 "success": False,
                 "error": "No subsidies available in the system."
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-        # Convert to list and format for recommender
-        subsidies_list = []
-        for subsidy in subsidies:
-            subsidies_list.append({
-                'id': subsidy['id'],
-                'title': subsidy['title'],
-                'description': subsidy['description'],
-                'amount': float(subsidy['amount']),
-                'eligibility_criteria': subsidy['eligibility'] if subsidy['eligibility'] else [],
-                'documents_required': subsidy['documents_required'] if subsidy['documents_required'] else [],
-                'application_start_date': subsidy['application_start_date'].isoformat() if subsidy['application_start_date'] else None,
-                'application_end_date': subsidy['application_end_date'].isoformat() if subsidy['application_end_date'] else None,
-            })
-        
-        # Create cache key for this specific farmer profile
+
+        # Create a cache key for this specific farmer profile + subsidy set
         cache_key_data = {
             'farmer_profile': farmer_profile,
-            'subsidy_count': len(subsidies_list)
+            'subsidy_count': len(subsidies)
         }
         cache_key = f"subsidy_rec_{hashlib.md5(json.dumps(cache_key_data, sort_keys=True).encode()).hexdigest()}"
-        
-        # Try to get from cache first (5-minute cache)
+
+        # Try recommendation cache first (5-minute TTL)
         recommendation_result = cache.get(cache_key)
-        
+
         if recommendation_result is None:
-            # Get recommendations using FastSubsidyRecommander
             try:
                 recommender = SubsidyRecommander()
-                recommendation_result = recommender.recommend_subsidies(farmer_profile, subsidies_list)
-                
-                # Cache the result for 5 minutes
+                recommendation_result = recommender.recommend_subsidies(farmer_profile, subsidies)
                 cache.set(cache_key, recommendation_result, 300)
-                print(f"Generated new recommendations for farmer profile")
+                print("Generated new recommendations for farmer profile")
             except Exception as e:
-                print(f"Error creating or using recommender: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
         else:
-            print(f"Retrieved recommendations from cache")
-        
-        # Format response to match frontend expectations
+            print("Retrieved recommendations from cache")
+
         formatted_response = {
             "success": True,
             "recommendations": recommendation_result.get("recommended_subsidies", []),
             "total_found": recommendation_result.get("total_recommended", 0),
-            "summary": f"Based on your profile as a {farmer_profile.get('farmer_type', 'farmer')} with {farmer_profile.get('land_size', 'unknown')} acres growing {farmer_profile.get('crop_type', 'crops')} in {farmer_profile.get('district', 'your area')}, {farmer_profile.get('state', '')}, we found {recommendation_result.get('total_recommended', 0)} eligible subsidies tailored to your needs."
+            "llm_analysis": recommendation_result.get("llm_analysis", ""),
+            "retrieval_context": recommendation_result.get("retrieval_context", ""),
+            "summary": (
+                f"Based on your profile as a {farmer_profile.get('farmer_type', 'farmer')} "
+                f"with {farmer_profile.get('land_size', 'unknown')} acres growing "
+                f"{farmer_profile.get('crop_type', 'crops')} in "
+                f"{farmer_profile.get('district', 'your area')}, {farmer_profile.get('state', '')}, "
+                f"we found {recommendation_result.get('total_recommended', 0)} eligible subsidies "
+                "tailored to your needs."
+            ),
         }
-        
+
         return Response(formatted_response, status=status.HTTP_200_OK)
-    
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -123,11 +147,11 @@ def recommend_subsidies(request):
             "error": str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def recommendation_status(request):
     return Response({
         "success": True,
         "message": "Subsidy Recommendation Service is operational."
-    }, status=status.HTTP_200_OK)    
-        
+    }, status=status.HTTP_200_OK)
